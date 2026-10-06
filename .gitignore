@@ -1,0 +1,9 @@
+.venv/
+.venv*/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+best_score.json
+build/
+dist/
+*.spec
