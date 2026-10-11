@@ -14,41 +14,36 @@ class GestureController:
         """Initialize MediaPipe hands and gesture detection"""
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_face = mp.solutions.face_detection
         
         # Initialize hands detection
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        
-        # Initialize face detection
-        self.face_detection = self.mp_face.FaceDetection(
-            model_selection=0,
-            min_detection_confidence=0.5
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4
         )
         
         # Gesture state tracking
         self.previous_position = None
-        self.position_smoothing = 0.5
-        self.gesture_threshold = 0.04
-        self.position_history = deque(maxlen=8)
+        self.position_smoothing = 0.85
+        self.movement_coherence = 0.7
+        self.direction_dominance = 1.25
+        self.gesture_windows = ((5, 0.07), (12, 0.06), (30, 0.055))
+        self.position_history = deque(maxlen=40)
         self.current_direction = None
         self.gesture_cooldown = 0
-        self.max_cooldown = 5
+        self.max_cooldown = 3
         self.closed = False
         
-    def detect_gestures(self, frame: np.ndarray) -> Tuple[Optional[str], bool, np.ndarray]:
+    def detect_gestures(self, frame: np.ndarray) -> Tuple[Optional[str], np.ndarray]:
         """
-        Detect hand gestures and return direction and pinch state
+        Detect hand gestures and return the direction and annotated frame.
         
         Args:
             frame: Input video frame
             
         Returns:
-            Tuple of (direction, is_pinching, annotated_frame)
+            Tuple of (direction, annotated_frame)
         """
         # Convert BGR to RGB
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -56,19 +51,10 @@ class GestureController:
         # Process hands
         hand_results = self.hands.process(rgb_frame)
         
-        # Process face
-        face_results = self.face_detection.process(rgb_frame)
-        
         # Create annotated frame
         annotated_frame = frame.copy()
         
         direction = None
-        is_pinching = False
-        
-        # Draw face detections
-        if face_results.detections:
-            for detection in face_results.detections:
-                mp.solutions.drawing_utils.draw_detection(annotated_frame, detection)
         
         # Process hand landmarks
         if hand_results.multi_hand_landmarks:
@@ -112,60 +98,65 @@ class GestureController:
 
                 if self.gesture_cooldown > 0:
                     self.gesture_cooldown -= 1
-                    self.position_history.clear()
-                    self.position_history.append(current_pos.copy())
-                else:
-                    self.position_history.append(current_pos.copy())
-                    if len(self.position_history) >= 4:
-                        movement = self.position_history[-1] - self.position_history[0]
 
-                        # Use net movement over several frames to reject landmark jitter.
-                        if np.linalg.norm(movement) < self.gesture_threshold:
-                            movement = None
+                self.position_history.append(current_pos.copy())
+                for window_size, movement_threshold in self.gesture_windows:
+                    if len(self.position_history) > window_size:
+                        positions = list(self.position_history)[-window_size - 1:]
+                        movement = positions[-1] - positions[0]
+                        path_length = sum(
+                            np.linalg.norm(current - previous)
+                            for previous, current in zip(
+                                positions, positions[1:]
+                            )
+                        )
+                        coherence = (
+                            np.linalg.norm(movement) / path_length
+                            if path_length > 0
+                            else 0.0
+                        )
 
-                    else:
-                        movement = None
+                        if (
+                            np.linalg.norm(movement) < movement_threshold
+                            or coherence < self.movement_coherence
+                        ):
+                            continue
 
-                    if movement is not None:
-                        if abs(movement[0]) > abs(movement[1]):
+                        horizontal = abs(movement[0])
+                        vertical = abs(movement[1])
+                        if horizontal >= vertical * self.direction_dominance:
                             direction = "RIGHT" if movement[0] > 0 else "LEFT"
-                        else:
+                        elif vertical >= horizontal * self.direction_dominance:
                             direction = "DOWN" if movement[1] > 0 else "UP"
 
-                        self.current_direction = direction
-                        self.gesture_cooldown = self.max_cooldown
-                        self.position_history.clear()
-                        self.position_history.append(current_pos.copy())
-                
-                # Detect pinch gesture (thumb and index finger close)
-                thumb_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.THUMB_TIP]
-                index_tip = hand_landmarks.landmark[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
-                
-                thumb_pos = np.array([thumb_tip.x, thumb_tip.y])
-                index_pos = np.array([index_tip.x, index_tip.y])
-                
-                distance = np.linalg.norm(thumb_pos - index_pos)
-                is_pinching = distance < 0.05
-                
-                # Draw pinch indicator
-                if is_pinching:
-                    cv2.putText(annotated_frame, "SPEED BOOST!", (10, 30), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                        if direction is not None:
+                            break
+
+                if self.gesture_cooldown == 0 and direction is not None:
+                    self.current_direction = direction
+                    self.gesture_cooldown = self.max_cooldown
+                    self.position_history.clear()
+                    self.position_history.append(current_pos.copy())
                 
                 self.previous_position = current_pos
         else:
             self.reset_gesture_state()
-        
-        # Update cooldown
-        if self.gesture_cooldown > 0:
-            self.gesture_cooldown -= 1
+            cv2.putText(
+                annotated_frame,
+                "NO HAND DETECTED",
+                (10, 70),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2,
+            )
         
         # Display current direction
         if self.current_direction:
             cv2.putText(annotated_frame, f"Direction: {self.current_direction}", 
                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
         
-        return direction, is_pinching, annotated_frame
+        return direction, annotated_frame
     
     def reset_gesture_state(self):
         """Reset gesture detection state"""
@@ -181,7 +172,7 @@ class GestureController:
         self.closed = True
 
         close_errors = []
-        for resource in (self.hands, self.face_detection):
+        for resource in (self.hands,):
             try:
                 resource.close()
             except Exception as error:

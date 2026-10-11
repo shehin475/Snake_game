@@ -6,10 +6,16 @@ Classic snake game with a premium interface and gesture-based controls.
 import json
 import os
 import random
+import sys
 from enum import Enum
-from typing import Optional
+from typing import Optional, TypedDict
 
 import pygame
+
+
+class LeaderboardEntry(TypedDict):
+    name: str
+    score: int
 
 
 class Direction(Enum):
@@ -20,6 +26,10 @@ class Direction(Enum):
 
 
 class SnakeGame:
+    MIN_SPEED = 6
+    MAX_SPEED = 20
+    SPEED_INCREASE_SCORE = 50
+
     def __init__(self, width: int = 780, height: int = 760):
         """Initialize the Nokia Snake game"""
         self.width = width
@@ -52,32 +62,212 @@ class SnakeGame:
         self.small_font = pygame.font.Font(None, 22)
         self.mini_font = pygame.font.Font(None, 18)
 
-        self.best_score = self.load_best_score()
+        self.player_name = ""
+        self.awaiting_player_name = True
+        self.changing_player = False
+        self.player_setup_mode = "choice"
+        self.selected_player_index = 0
+        self.player_search_query = ""
+        self.player_entry_error = ""
+        self.best_score, self.leaderboard = self.load_score_data()
         self.reset_game()
         self.particles = []
 
-    def load_best_score(self) -> int:
-        """Load the highest score from disk."""
-        score_path = os.path.join(os.path.dirname(__file__), "best_score.json")
+    def score_file_path(self) -> str:
+        """Return the path used to persist scores and leaderboard entries."""
+        if getattr(sys, "frozen", False):
+            data_directory = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+            return os.path.join(data_directory, "NokiaSnake", "best_score.json")
+        return os.path.join(os.path.dirname(__file__), "best_score.json")
+
+    def load_score_data(self) -> tuple[int, list[LeaderboardEntry]]:
+        """Load the global best score and name-keyed leaderboard from disk."""
+        score_path = self.score_file_path()
+        best_score = 0
+        leaderboard_by_name: dict[str, LeaderboardEntry] = {}
         try:
             if os.path.exists(score_path):
                 with open(score_path, "r", encoding="utf-8") as handle:
                     data = json.load(handle)
-                    if isinstance(data, dict) and "best_score" in data:
-                        return int(data["best_score"])
-        except (OSError, ValueError, json.JSONDecodeError):
-            return 0
-        return 0
+                if isinstance(data, dict):
+                    try:
+                        best_score = max(0, int(data.get("best_score", 0)))
+                    except (TypeError, ValueError):
+                        best_score = 0
 
-    def save_best_score(self) -> None:
-        """Persist the best score to disk."""
-        score_path = os.path.join(os.path.dirname(__file__), "best_score.json")
-        payload = {"best_score": max(0, self.best_score)}
+                    entries = data.get("leaderboard", [])
+                    if isinstance(entries, list):
+                        for entry in entries:
+                            if not isinstance(entry, dict):
+                                continue
+                            name = entry.get("name")
+                            try:
+                                score = int(entry.get("score", 0))
+                            except (TypeError, ValueError):
+                                continue
+                            if not isinstance(name, str) or not name.strip() or score < 0:
+                                continue
+                            name = name.strip()[:16]
+                            key = name.casefold()
+                            previous = leaderboard_by_name.get(key)
+                            if previous is None or score > previous["score"]:
+                                leaderboard_by_name[key] = {
+                                    "name": name,
+                                    "score": score,
+                                }
+        except (OSError, json.JSONDecodeError) as error:
+            print(f"Warning: Could not load saved scores: {error}")
+
+        leaderboard = sorted(
+            leaderboard_by_name.values(),
+            key=lambda entry: (-entry["score"], entry["name"].casefold()),
+        )
+        return best_score, leaderboard
+
+    def save_score_data(self) -> None:
+        """Persist global and per-player best scores."""
+        payload = {
+            "best_score": max(0, self.best_score),
+            "leaderboard": self.leaderboard,
+        }
+        score_path = self.score_file_path()
         try:
+            os.makedirs(os.path.dirname(score_path), exist_ok=True)
             with open(score_path, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle)
-        except OSError:
-            pass
+        except OSError as error:
+            print(f"Warning: Could not save scores: {error}")
+
+    def record_score(self) -> None:
+        """Update the global best and this player's name-keyed best score."""
+        self.best_score = max(self.best_score, self.score)
+        if self.player_name:
+            key = self.player_name.casefold()
+            for entry in self.leaderboard:
+                if entry["name"].casefold() == key:
+                    entry["name"] = self.player_name
+                    entry["score"] = max(entry["score"], self.score)
+                    break
+            else:
+                self.leaderboard.append({"name": self.player_name, "score": self.score})
+
+            self.leaderboard.sort(
+                key=lambda entry: (-entry["score"], entry["name"].casefold())
+            )
+        self.save_score_data()
+
+    def matching_players(self) -> list[LeaderboardEntry]:
+        """Return saved players whose IDs contain the current search text."""
+        query = self.player_search_query.strip().casefold()
+        if not query:
+            return self.leaderboard
+        return [
+            entry
+            for entry in self.leaderboard
+            if query in entry["name"].casefold()
+        ]
+
+    def handle_name_input(self, event) -> bool:
+        """Handle player choice or name entry; return True when a game starts."""
+        if not self.awaiting_player_name:
+            return False
+
+        if event.type == pygame.TEXTINPUT and self.player_setup_mode == "existing":
+            if len(self.player_search_query) + len(event.text) <= 16:
+                self.player_search_query += event.text
+                self.selected_player_index = 0
+                self.player_entry_error = ""
+        elif event.type == pygame.TEXTINPUT and self.player_setup_mode == "new":
+            for character in event.text:
+                if character.isprintable() and len(self.player_name) < 16:
+                    self.player_name += character
+        elif event.type == pygame.KEYDOWN:
+            if self.player_setup_mode == "choice":
+                if event.key == pygame.K_n:
+                    self.player_setup_mode = "new"
+                    self.player_name = ""
+                    self.player_entry_error = ""
+                    pygame.key.start_text_input()
+                elif event.key == pygame.K_e:
+                    if self.leaderboard:
+                        self.player_setup_mode = "existing"
+                        self.selected_player_index = 0
+                        self.player_search_query = ""
+                        self.player_entry_error = ""
+                        pygame.key.start_text_input()
+                    else:
+                        self.player_entry_error = "No existing players yet. Choose New Player."
+            elif self.player_setup_mode == "existing":
+                matches = self.matching_players()
+                if event.key == pygame.K_BACKSPACE:
+                    self.player_search_query = self.player_search_query[:-1]
+                    self.selected_player_index = 0
+                    self.player_entry_error = ""
+                elif event.key in (pygame.K_UP, pygame.K_w) and matches:
+                    self.selected_player_index = (
+                        self.selected_player_index - 1
+                    ) % len(matches)
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    if matches:
+                        self.selected_player_index = (
+                            self.selected_player_index + 1
+                        ) % len(matches)
+                elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    if matches:
+                        self.player_name = matches[self.selected_player_index]["name"]
+                        self.awaiting_player_name = False
+                        self.changing_player = False
+                        self.player_setup_mode = "choice"
+                        pygame.key.stop_text_input()
+                        self.reset_game()
+                        return True
+                    self.player_entry_error = "No players match that search."
+                elif event.key == pygame.K_ESCAPE:
+                    self.player_setup_mode = "choice"
+                    self.player_entry_error = ""
+                    self.player_search_query = ""
+                    pygame.key.stop_text_input()
+            elif event.key == pygame.K_BACKSPACE:
+                self.player_name = self.player_name[:-1]
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.player_name = self.player_name.strip()
+                if self.player_name:
+                    existing_names = {
+                        entry["name"].casefold() for entry in self.leaderboard
+                    }
+                    if self.player_name.casefold() in existing_names:
+                        self.player_entry_error = (
+                            "That player ID is already used. Choose Existing Player."
+                        )
+                    else:
+                        self.leaderboard.append(
+                            {"name": self.player_name, "score": 0}
+                        )
+                        self.leaderboard.sort(
+                            key=lambda entry: (
+                                -entry["score"],
+                                entry["name"].casefold(),
+                            )
+                        )
+                        self.save_score_data()
+                        self.awaiting_player_name = False
+                        self.changing_player = False
+                        self.player_setup_mode = "choice"
+                        self.player_entry_error = ""
+                        pygame.key.stop_text_input()
+                        self.reset_game()
+                        return True
+        return False
+
+    def start_player_change(self) -> None:
+        """Open the new/existing player choice from the game-over screen."""
+        if not self.game_over or self.awaiting_player_name:
+            return
+        self.player_name = ""
+        self.awaiting_player_name = True
+        self.changing_player = True
+        self.player_setup_mode = "choice"
+        self.player_entry_error = ""
 
     def reset_game(self):
         """Reset game to initial state"""
@@ -89,9 +279,6 @@ class SnakeGame:
 
         self.score = 0
         self.game_over = False
-        self.speed_boost = False
-        self.base_speed = 8
-        self.boost_speed = 15
         self.particles = []
         self.spawn_fruit()
 
@@ -129,7 +316,7 @@ class SnakeGame:
 
     def change_direction(self, new_direction: str):
         """Change snake direction based on gesture input"""
-        if self.game_over:
+        if self.game_over or self.awaiting_player_name:
             return
 
         direction_map = {
@@ -148,16 +335,15 @@ class SnakeGame:
                 Direction.RIGHT: Direction.LEFT,
             }
 
-            if new_dir != opposite.get(self.direction):
+            if (
+                new_dir != opposite.get(self.direction)
+                and new_dir != opposite.get(self.next_direction)
+            ):
                 self.next_direction = new_dir
-
-    def set_speed_boost(self, boost: bool):
-        """Set speed boost state."""
-        self.speed_boost = boost
 
     def update(self):
         """Update game state."""
-        if self.game_over:
+        if self.game_over or self.awaiting_player_name:
             return
 
         self.direction = self.next_direction
@@ -168,22 +354,19 @@ class SnakeGame:
 
         if new_head[0] < 0 or new_head[0] >= self.grid_width or new_head[1] < 0 or new_head[1] >= self.grid_height:
             self.game_over = True
-            self.best_score = max(self.best_score, self.score)
-            self.save_best_score()
+            self.record_score()
             return
 
         if new_head in self.snake:
             self.game_over = True
-            self.best_score = max(self.best_score, self.score)
-            self.save_best_score()
+            self.record_score()
             return
 
         self.snake.insert(0, new_head)
 
         if new_head == self.fruit:
             self.score += 10
-            self.best_score = max(self.best_score, self.score)
-            self.save_best_score()
+            self.record_score()
             self.add_particle_effect(new_head[0], new_head[1])
             self.spawn_fruit()
         else:
@@ -275,47 +458,175 @@ class SnakeGame:
         self.screen.blit(label, (x + 14, y + 14))
         self.screen.blit(value_text, (x + 14, y + 34))
 
-    def draw_speed_meter(self):
-        """Draw a boost meter for the speed state."""
-        meter_rect = pygame.Rect(40, 680, 240, 24)
-        self.draw_rounded_rect(self.screen, meter_rect, (7, 18, 22), radius=12, border_color=(86, 110, 74), border_width=2)
-
-        fill_width = 240 if self.speed_boost else 120
-        target = self.boost_speed if self.speed_boost else self.base_speed
-        current = min(1.0, target / self.boost_speed)
-        fill_width = int(220 * current)
-        fill_rect = pygame.Rect(52, 688, fill_width, 8)
-        fill_color = self.LIGHT_GREEN if self.speed_boost else self.ACCENT
-        pygame.draw.rect(self.screen, fill_color, fill_rect, border_radius=6)
-
-        status_text = self.small_font.render("BOOST" if self.speed_boost else "READY", True, self.WHITE)
-        self.screen.blit(status_text, (300, 684))
-
     def draw_ui(self):
         """Draw the dashboard and overlays."""
         self.draw_stat_card("Score", self.score, 340, 28, self.GOLD)
         self.draw_stat_card("Best", self.best_score, 520, 28, self.ACCENT)
         self.draw_stat_card("Speed", self.get_current_speed(), 630, 28, self.LIGHT_GREEN)
 
-        hint = self.small_font.render("Gesture: swipe to steer • pinch for boost", True, (215, 225, 220))
-        self.screen.blit(hint, (40, 660))
-        self.draw_speed_meter()
+        if self.player_name:
+            player_text = self.mini_font.render(
+                f"PLAYER: {self.player_name}",
+                True,
+                (182, 196, 193),
+            )
+            self.screen.blit(player_text, (42, 116))
 
-        if self.game_over:
+        hint = self.small_font.render(
+            "Swipe to steer • speed increases every 50 points",
+            True,
+            (215, 225, 220),
+        )
+        self.screen.blit(hint, (40, 660))
+
+        if self.awaiting_player_name or self.game_over:
             overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
             pygame.draw.rect(overlay, (4, 10, 12, 180), overlay.get_rect(), border_radius=18)
             self.screen.blit(overlay, (0, 0))
 
-            panel_rect = pygame.Rect(170, 220, 440, 260)
+            panel_rect = pygame.Rect(130, 145, 520, 470)
             self.draw_rounded_rect(self.screen, panel_rect, (18, 34, 35), radius=28, border_color=(112, 163, 117), border_width=2)
 
-            game_over_text = self.font.render("GAME OVER", True, self.WHITE)
-            final_score_text = self.font.render(f"Final Score: {self.score}", True, self.LIGHT_GREEN)
-            restart_text = self.small_font.render("Swipe Up to Restart", True, self.WHITE)
+            if self.awaiting_player_name:
+                if self.player_setup_mode == "choice":
+                    title_text = "CHANGE PLAYER" if self.changing_player else "PLAYER SETUP"
+                    title = self.font.render(title_text, True, self.WHITE)
+                    prompt = self.small_font.render(
+                        "Choose how to continue", True, self.LIGHT_GREEN
+                    )
+                    options = self.small_font.render(
+                        "N  -  New Player", True, self.WHITE
+                    )
+                    existing = self.small_font.render(
+                        "E  -  Existing Player", True, self.WHITE
+                    )
+                    self.screen.blit(title, title.get_rect(center=(self.width // 2, 205)))
+                    self.screen.blit(prompt, prompt.get_rect(center=(self.width // 2, 250)))
+                    self.screen.blit(options, options.get_rect(center=(self.width // 2, 295)))
+                    self.screen.blit(existing, existing.get_rect(center=(self.width // 2, 330)))
+                elif self.player_setup_mode == "new":
+                    title = self.font.render("NEW PLAYER", True, self.WHITE)
+                    prompt = self.small_font.render(
+                        "Enter a unique ID (up to 16 characters), then press Enter",
+                        True,
+                        self.LIGHT_GREEN,
+                    )
+                    name_text = self.font.render(self.player_name + "|", True, self.WHITE)
+                    self.screen.blit(title, title.get_rect(center=(self.width // 2, 205)))
+                    self.screen.blit(prompt, prompt.get_rect(center=(self.width // 2, 255)))
+                    self.screen.blit(name_text, name_text.get_rect(center=(self.width // 2, 300)))
+                else:
+                    title = self.font.render("EXISTING PLAYER", True, self.WHITE)
+                    prompt = self.small_font.render(
+                        "Type to search • Up/Down to select • Enter to continue",
+                        True,
+                        self.LIGHT_GREEN,
+                    )
+                    self.screen.blit(title, title.get_rect(center=(self.width // 2, 195)))
+                    self.screen.blit(prompt, prompt.get_rect(center=(self.width // 2, 235)))
+                    search_text = self.small_font.render(
+                        f"Search: {self.player_search_query}|",
+                        True,
+                        self.WHITE,
+                    )
+                    self.screen.blit(
+                        search_text,
+                        search_text.get_rect(center=(self.width // 2, 265)),
+                    )
+                    matching_players = self.matching_players()
+                    visible_count = 8
+                    first_visible = max(
+                        0, min(
+                            self.selected_player_index - visible_count // 2,
+                            len(matching_players) - visible_count,
+                        )
+                    )
+                    for index in range(
+                        first_visible,
+                        min(first_visible + visible_count, len(matching_players)),
+                    ):
+                        entry = matching_players[index]
+                        marker = ">" if index == self.selected_player_index else " "
+                        row = self.small_font.render(
+                            f"{marker} {entry['name']}  -  {entry['score']}",
+                            True,
+                            self.GOLD if index == self.selected_player_index else self.WHITE,
+                        )
+                        self.screen.blit(
+                            row,
+                            row.get_rect(center=(self.width // 2, 300 + (index - first_visible) * 30)),
+                        )
+                if self.player_entry_error:
+                    error_text = self.mini_font.render(
+                        self.player_entry_error, True, self.RED
+                    )
+                    self.screen.blit(
+                        error_text,
+                        error_text.get_rect(
+                            center=(
+                                self.width // 2,
+                                555 if self.player_setup_mode == "existing" else 340,
+                            )
+                        ),
+                    )
+                if (
+                    self.awaiting_player_name
+                    and self.player_setup_mode == "existing"
+                    and not self.matching_players()
+                    and not self.player_entry_error
+                ):
+                    no_matches_text = self.mini_font.render(
+                        "No players match that search.", True, self.RED
+                    )
+                    self.screen.blit(
+                        no_matches_text,
+                        no_matches_text.get_rect(center=(self.width // 2, 555)),
+                    )
+            else:
+                game_over_text = self.font.render("GAME OVER", True, self.WHITE)
+                final_score_text = self.font.render(f"Final Score: {self.score}", True, self.LIGHT_GREEN)
+                restart_text = self.small_font.render(
+                    "Swipe Up or press Enter to Restart", True, self.WHITE
+                )
+                self.screen.blit(game_over_text, game_over_text.get_rect(center=(self.width // 2, 185)))
+                self.screen.blit(final_score_text, final_score_text.get_rect(center=(self.width // 2, 228)))
+                self.screen.blit(restart_text, restart_text.get_rect(center=(self.width // 2, 575)))
+                change_player_text = self.small_font.render(
+                    "Press P to Change Player", True, self.LIGHT_GREEN
+                )
+                self.screen.blit(
+                    change_player_text,
+                    change_player_text.get_rect(center=(self.width // 2, 601)),
+                )
 
-            self.screen.blit(game_over_text, game_over_text.get_rect(center=(self.width // 2, 290)))
-            self.screen.blit(final_score_text, final_score_text.get_rect(center=(self.width // 2, 340)))
-            self.screen.blit(restart_text, restart_text.get_rect(center=(self.width // 2, 392)))
+            if not self.awaiting_player_name or self.player_setup_mode != "existing":
+                is_name_entry = self.awaiting_player_name
+                leaderboard_y = 405 if is_name_entry else 300
+                first_row_y = 435 if is_name_entry else 338
+                row_spacing = 26 if is_name_entry else 28
+                leaderboard_title = self.font.render("LEADERBOARD", True, self.GOLD)
+                self.screen.blit(
+                    leaderboard_title,
+                    leaderboard_title.get_rect(center=(self.width // 2, leaderboard_y)),
+                )
+                for rank, entry in enumerate(self.leaderboard[:5], start=1):
+                    row = self.small_font.render(
+                        f"{rank}.  {entry['name']}  -  {entry['score']}",
+                        True,
+                        self.WHITE,
+                    )
+                    self.screen.blit(
+                        row,
+                        row.get_rect(center=(self.width // 2, first_row_y + rank * row_spacing)),
+                    )
+                if not self.leaderboard:
+                    empty = self.small_font.render(
+                        "No scores yet", True, (182, 196, 193)
+                    )
+                    self.screen.blit(
+                        empty,
+                        empty.get_rect(center=(self.width // 2, first_row_y + row_spacing)),
+                    )
 
     def handle_restart(self, gesture: Optional[str]):
         """Handle game restart."""
@@ -323,15 +634,18 @@ class SnakeGame:
             self.reset_game()
 
     def get_current_speed(self) -> int:
-        """Get current game speed."""
-        return self.boost_speed if self.speed_boost else self.base_speed
+        """Increase game speed from its minimum as the score grows, up to the cap."""
+        return min(
+            self.MIN_SPEED + self.score // self.SPEED_INCREASE_SCORE,
+            self.MAX_SPEED,
+        )
 
     def draw(self):
         """Draw the game."""
         self.draw_background()
         self.draw_grid(self.screen)
 
-        if not self.game_over:
+        if not self.game_over and not self.awaiting_player_name:
             for i, segment in enumerate(self.snake):
                 self.draw_snake_segment(self.screen, segment[0], segment[1], i == 0)
             self.draw_fruit(self.screen)

@@ -19,7 +19,6 @@ class GameManager:
         
         # Gesture state
         self.current_gesture = None
-        self.is_speed_boost = False
         
     def initialize_camera(self):
         """Initialize the webcam"""
@@ -31,6 +30,7 @@ class GameManager:
         # Set camera properties
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return True
     
     def gesture_detection_loop(self):
@@ -47,13 +47,12 @@ class GameManager:
                 frame = cv2.flip(frame, 1)
                 
                 # Detect gestures
-                gesture, pinch, annotated_frame = self.gesture_controller.detect_gestures(frame)
+                gesture, annotated_frame = self.gesture_controller.detect_gestures(frame)
                 
                 # Update gesture state
                 with self.gesture_state_lock:
                     if gesture is not None:
                         self.current_gesture = gesture
-                    self.is_speed_boost = pinch
                 
                 # Display gesture window
                 cv2.imshow('Nokia Snake - Gesture Control', annotated_frame)
@@ -62,8 +61,6 @@ class GameManager:
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.running = False
                     break
-                
-                time.sleep(0.033)  # ~30 FPS
         except Exception as error:
             self.gesture_error = error
             self.running = False
@@ -86,7 +83,7 @@ class GameManager:
             print("Nokia Snake Game Started!")
             print("Controls:")
             print("- Move your hand up/down/left/right to control the snake")
-            print("- Pinch thumb and index finger for speed boost")
+            print("- Speed starts at 6 and increases every 50 points")
             print("- Swipe your hand upward when game over to restart")
             print("- Press ESC in game window to quit")
             print("\nGame Window: Classic Nokia Snake")
@@ -105,25 +102,41 @@ class GameManager:
                     elif event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_ESCAPE:
                             self.running = False
+                        elif (
+                            event.key in (pygame.K_RETURN, pygame.K_KP_ENTER)
+                            and self.game.game_over
+                            and not self.game.awaiting_player_name
+                        ):
+                            self.game.handle_restart("UP")
+                        elif (
+                            event.key == pygame.K_p
+                            and self.game.game_over
+                            and not self.game.awaiting_player_name
+                        ):
+                            self.game.start_player_change()
+
+                    if self.game.handle_name_input(event):
+                        with self.gesture_state_lock:
+                            self.current_gesture = None
+                        last_update = current_time
                 
                 # Apply gesture controls
                 with self.gesture_state_lock:
-                    gesture = self.current_gesture
+                    gesture = None if self.game.awaiting_player_name else self.current_gesture
                     self.current_gesture = None
-                    speed_boost = self.is_speed_boost
 
-                if gesture:
+                if gesture and not self.game.awaiting_player_name:
                     if self.game.game_over:
                         self.game.handle_restart(gesture)
                     else:
                         self.game.change_direction(gesture)
                 
-                # Apply speed boost
-                self.game.set_speed_boost(speed_boost)
-                
                 # Update game at appropriate speed
                 target_fps = self.game.get_current_speed()
-                if current_time - last_update >= 1.0 / target_fps:
+                if (
+                    not self.game.awaiting_player_name
+                    and current_time - last_update >= 1.0 / target_fps
+                ):
                     self.game.update()
                     last_update = current_time
                 

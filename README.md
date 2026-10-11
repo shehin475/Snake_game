@@ -51,6 +51,12 @@ python main.py
 ```
 
 The game opens a Pygame window and a separate webcam window showing hand tracking.
+At launch, choose **New Player** or **Existing Player**. New player IDs must be
+unique (case-insensitively); existing players can be searched by typing part of
+their ID, then selected from the filtered list.
+The local leaderboard keeps each player's best score.
+The snake starts at 6 moves per second and gains 1 move per second for every
+50 points, up to 20 moves per second.
 
 ## Download a Windows release
 
@@ -64,9 +70,12 @@ builds the Windows executable and attaches it to a GitHub Release automatically.
 ## Controls
 
 - Move your hand to swipe up, down, left, or right to steer the snake.
-- Pinch your thumb and index finger to activate the speed boost.
-- The game filters small tracking jitters; if the hand leaves the frame, direction tracking resets until it is detected again.
+- The snake's speed increases as your score grows.
+- Gesture detection requires a clear, sustained hand movement before steering, filtering tiny motions, tracking jitter, and ambiguous diagonals. If the hand leaves the frame, direction tracking resets until it is detected again.
 - After game over, swipe your hand upward to restart. Move the hand clearly in the camera view; a held-up hand pose is not enough.
+- Press **P** on the game-over screen to change player. Choose an existing ID or create a new unique ID; the completed game's score remains credited to the previous player.
+- The top five local player best scores are shown on the name-entry and game-over screens. Python runs store scores in `best_score.json`; the Windows release stores them in `%LOCALAPPDATA%\NokiaSnake\best_score.json`.
+- Press **Enter** on the game-over screen to restart without a gesture.
 - Press **Esc** in the game window or **Q** in the webcam window to quit.
 
 ## Webcam permissions and troubleshooting

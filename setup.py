@@ -33,7 +33,7 @@ def main():
     print()
     print("Game Controls:")
     print("- Move your hand up/down/left/right to control the snake")
-    print("- Pinch thumb and index finger for speed boost")
+    print("- Speed starts at 6 and increases every 50 points")
     print("- Show 'UP' gesture when game over to restart")
     print("- Press ESC in game window to quit")
     print()
